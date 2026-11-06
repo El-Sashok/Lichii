@@ -85,43 +85,61 @@ bool AcquireMatches(u32 operation, u32 value, u32 current) {
 // QMD release the front noted with its words): the back runs it in order before anything this
 // channel sends next, so the front does not wait for it. Only a queued write counts, never the
 // value guest memory holds now. The back checks the value where the acquire was.
-bool PredictedMet(DmaPusher& dma_pusher, GPUVAddr address, u32 value, u32 operation,
-                  bool count) {
+enum class Prediction { Unknown, Met, Unmet };
+
+std::atomic<u64> g_acquire_unmet{};
+std::atomic<u64> g_poll_met{};
+std::atomic<u64> g_poll_unmet{};
+
+Prediction PredictAcquire(DmaPusher& dma_pusher, GPUVAddr address, u32 value, u32 operation,
+                          bool count) {
     static const bool enabled = [] {
         const char* env = std::getenv("EDEN_NX2_PREDICT_ACQUIRES");
         return env == nullptr || env[0] != '0';
     }();
     auto& split = VideoCommon::GpuSplit::Get();
     if (count && g_acquire_checks.fetch_add(1, std::memory_order_relaxed) % 4096 == 4095) {
-        LOG_INFO(HW_GPU, "NX2 acquires last 4096: {} predicted ({} wrong), {} drained",
-                 g_acquire_predicted.load(), g_acquire_predicted_wrong.exchange(0),
-                 4096 - g_acquire_predicted.exchange(0));
+        const u64 met = g_acquire_predicted.exchange(0);
+        const u64 unmet = g_acquire_unmet.exchange(0);
+        LOG_INFO(HW_GPU, "NX2 acquires last 4096: {} predicted met ({} wrong), {} predicted unmet, {} drained; polls without drain: {} met, {} unmet",
+                 met, g_acquire_predicted_wrong.exchange(0), unmet, 4096 - met - unmet,
+                 g_poll_met.exchange(0), g_poll_unmet.exchange(0));
     }
     if (!enabled || !split.Active()) {
-        return false;
+        return Prediction::Unknown;
     }
     const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
     if (!device) {
-        return false;
+        return Prediction::Unknown;
     }
     const u64 since = split.ConsumedNow();
     const u32 memory_word = dma_pusher.memory_manager.Read<u32>(address);
     u32 word = memory_word;
-    if (!split.OverlayQueuedWrites(since, *device, &word, 1) ||
-        !AcquireMatches(operation, value, word)) {
-        return false;
+    if (!split.OverlayQueuedWrites(since, *device, &word, 1)) {
+        return Prediction::Unknown;
     }
-    if (word == memory_word && dma_pusher.rasterizer->MustFlushRegion(
-                                   *device, sizeof(u32), VideoCommon::CacheType::BufferCache)) {
-        return false;
+    const bool memory_final =
+        word != memory_word ||
+        (!dma_pusher.rasterizer->MustFlushRegion(*device, sizeof(u32),
+                                                 VideoCommon::CacheType::BufferCache) &&
+         Tegra::Nx2AsyncReportsSettled(*device, sizeof(u32)));
+    if (!AcquireMatches(operation, value, word)) {
+        if (!memory_final) {
+            return Prediction::Unknown;
+        }
+        (count ? g_acquire_unmet : g_poll_unmet).fetch_add(1, std::memory_order_relaxed);
+        return Prediction::Unmet;
     }
-    g_acquire_predicted.fetch_add(1, std::memory_order_relaxed);
+    if (word == memory_word && !memory_final) {
+        return Prediction::Unknown;
+    }
+    (count ? g_acquire_predicted : g_poll_met).fetch_add(1, std::memory_order_relaxed);
     split.Defer([memory = &dma_pusher.memory_manager, address, value, operation] {
         if (!AcquireMatches(operation, value, memory->Read<u32>(address))) {
             g_acquire_predicted_wrong.fetch_add(1, std::memory_order_relaxed);
         }
     });
-    return true;
+    return Prediction::Met;
 }
 
 // The fence manager records into the scheduler and downloads the CPU's writes over GPU data:
@@ -151,9 +169,14 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     if (!pending_acquire) {
         return true;
     }
-    if (PredictedMet(dma_pusher, pending_acquire->address, pending_acquire->value,
-                     pending_acquire->operation, false)) {
+    const auto prediction = PredictAcquire(dma_pusher, pending_acquire->address,
+                                           pending_acquire->value, pending_acquire->operation, false);
+    if (prediction == Prediction::Met) {
         return true;
+    }
+    if (prediction == Prediction::Unmet && !Nx2SemaphoreWaiters::Get().Latched(this) &&
+        std::chrono::steady_clock::now() - pending_acquire->since < std::chrono::seconds{2}) {
+        return false;
     }
     // The release may still be queued for the split GPU thread's back half (and the caches
     // ReadSemaphoreWord asks are its state).
@@ -323,7 +346,19 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             return;
         }
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
-        if (PredictedMet(dma_pusher, acquire.address, acquire.value, acquire.operation, true)) {
+        const auto prediction =
+            PredictAcquire(dma_pusher, acquire.address, acquire.value, acquire.operation, true);
+        if (prediction == Prediction::Met) {
+            return;
+        }
+        auto& waiters = Nx2SemaphoreWaiters::Get();
+        if (prediction == Prediction::Unmet) {
+            if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address)) {
+                waiters.Add(this, *device, acquire.value, acquire.operation);
+            }
+            pending_acquire = acquire;
+            dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
+            VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
             return;
         }
         DrainBack();
@@ -332,7 +367,6 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         }
         // Registered before the fences run, so a release among them that meets the value counts
         // even if a later one overwrites it.
-        auto& waiters = Nx2SemaphoreWaiters::Get();
         if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address)) {
             waiters.Add(this, *device, acquire.value, acquire.operation);
         }
