@@ -1474,7 +1474,13 @@ bool Maxwell3D::FrontDmaReadQueued(VideoCommon::GpuSplit& split, FrontState& fs,
         return false;
     }
     // A queued dispatch or copy marks the pages it writes when the back runs it.
-    split.WaitForWriters();
+    static const bool wait_writers = [] {
+        const char* value = std::getenv("EDEN_NX2_DMA_EARLY_WAIT_WRITERS");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (wait_writers) {
+        split.WaitForWriters();
+    }
     // Every page where a contiguous device range puts it: the queued-write checks look at
     // [*device, *device + read_bytes).
     for (GPUVAddr page = source & ~GPUVAddr{0xfff}; page < source + read_bytes; page += 0x1000) {
@@ -1554,9 +1560,28 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         memory_manager.ReadBlockUnsafe(source, diag_before.data(), read_bytes);
     }
     VideoCommon::Nx2Profile::CountDmaRead(macro);
-    if (diag_before.empty() && FrontDmaReadQueued(split, fs, macro, method, source, words)) {
+    static u64 early{}, drained{}, waits{}, settled{}, waited_us{}, max_us{};
+    static const bool early_reads = [] {
+        const char* value = std::getenv("EDEN_NX2_DMA_EARLY");
+        return value == nullptr || value[0] != '0';
+    }();
+    const auto report_stats = [&] {
+        if (early + drained != 65536) {
+            return;
+        }
+        LOG_INFO(HW_GPU,
+                 "NX2 MME DMA reads last 65536: {} early, {} drained, of which {} waited for the "
+                 "host GPU (avg {} us, max {} us) and {} had already landed",
+                 early, drained, waits, waits ? waited_us / waits : 0, max_us, settled);
+        early = drained = waits = settled = waited_us = max_us = 0;
+    };
+    if (early_reads && diag_before.empty() &&
+        FrontDmaReadQueued(split, fs, macro, method, source, words)) {
+        ++early;
+        report_stats();
         return;
     }
+    ++drained;
     split.Drain(VideoCommon::DrainSite::MacroDmaRead);
     // The drain issued the queued reports to the host GPU; their results reach guest memory only
     // when the host finishes them (EDEN_NX2_QUERY_DMA_WAIT=0 reads without waiting).
@@ -1581,7 +1606,6 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                 rasterizer->SignalReference();
             },
             VideoCommon::DrainSite::MacroDmaFlush);
-        static u64 waits{}, settled{}, waited_us{}, max_us{};
         if (!pending) {
             split.ClearReports(source, read_bytes);
             ++settled;
@@ -1609,14 +1633,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
             max_us = std::max(max_us, us);
             ++waits;
         }
-        if (waits + settled == 65536) {
-            LOG_INFO(HW_GPU,
-                     "NX2 report reads last 65536: {} waited for the host GPU (avg {} us, max {} "
-                     "us), {} already landed",
-                     waits, waits ? waited_us / waits : 0, max_us, settled);
-            waits = settled = waited_us = max_us = 0;
-        }
     }
+    report_stats();
     if (VideoCommon::QueryDma::TraceEnabled()) {
         split.Run(
             [this, macro, method, source, read_bytes] {
