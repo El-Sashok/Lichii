@@ -1119,7 +1119,7 @@ struct KeplerCompute::FrontState {
 
 // Mirrors the back's QMD scheduling to note the semaphore releases it will make, with their
 // values, as queued writes (GpuSplit::NoteMemoryWriteData): the puller's acquires on them need
-// not wait for the back (Puller::PredictedMet). A descriptor is read from memory with the queued
+// not wait for the back (Puller::PredictAcquire). A descriptor is read from memory with the queued
 // writes the front knows laid over it: the register copy of an inline QMD until the back writes
 // it, and the 4-byte uploads the game patches payloads with up to the launch.
 void KeplerCompute::FrontSignalQmd(FrontState& fs, VideoCommon::GpuSplit& split, GPUVAddr address,

@@ -1476,7 +1476,7 @@ bool Maxwell3D::FrontDmaReadQueued(VideoCommon::GpuSplit& split, FrontState& fs,
     // A queued dispatch or copy marks the pages it writes when the back runs it.
     static const bool wait_writers = [] {
         const char* value = std::getenv("EDEN_NX2_DMA_EARLY_WAIT_WRITERS");
-        return value == nullptr || value[0] != '0';
+        return value != nullptr && value[0] != '0';
     }();
     if (wait_writers) {
         split.WaitForWriters();
