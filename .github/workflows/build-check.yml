@@ -96,3 +96,6 @@ jobs:
 
       - name: Test debug adapter
         run: python3 tools/nx2/test_debug_mcp.py
+
+      - name: Test Linux switch discovery
+        run: CXX=g++-13 python3 tools/nx2/test_switches.py
