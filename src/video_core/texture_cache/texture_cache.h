@@ -410,7 +410,7 @@ void TextureCache<P>::TickFrame() {
                           largest.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
         for (size_t i = 0; i < std::min<size_t>(12, largest.size()); ++i) {
             const Image& image = *largest[i].second;
-            LOG_DEBUG(HW_GPU, "  {} MiB: {:#x} {}x{}x{} layers {} levels {} format {} type {} flags {:#x}",
+            LOG_INFO(HW_GPU, "  {} MiB: {:#x} {}x{}x{} layers {} levels {} format {} type {} flags {:#x}",
                      largest[i].first >> 20, image.gpu_addr, image.info.size.width, image.info.size.height,
                      image.info.size.depth, image.info.resources.layers, image.info.resources.levels,
                      static_cast<u32>(image.info.format), static_cast<u32>(image.info.type),
@@ -420,7 +420,7 @@ void TextureCache<P>::TickFrame() {
         for (const auto& [format, total] : by_format) formats.emplace_back(total.first, format);
         std::sort(formats.rbegin(), formats.rend());
         for (size_t i = 0; i < std::min<size_t>(8, formats.size()); ++i) {
-            LOG_DEBUG(HW_GPU, "  format {}: {} MiB in {} images", formats[i].second, formats[i].first >> 20,
+            LOG_INFO(HW_GPU, "  format {}: {} MiB in {} images", formats[i].second, formats[i].first >> 20,
                      by_format[formats[i].second].second);
         }
         if constexpr (requires { runtime.LogMemoryStatistics(); }) {
@@ -430,23 +430,23 @@ void TextureCache<P>::TickFrame() {
                  images_created, images_deleted, gc_deletes + gc_costly_deletes, gc_costly_deletes,
                  gc_download_deletes,
                  async_decodes_queued, astc_opaque_images, astc_alpha_images);
-        LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} uploads from guest memory, {} MiB (largest {} MiB, {} by layer)",
-                 images_uploaded, uploaded_bytes >> 20, largest_upload >> 20, layer_uploads);
-        images_uploaded = uploaded_bytes = largest_upload = layer_uploads = 0;
+        LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} uploads from guest memory, {} MiB (largest {} MiB, {} by layer), {} depth uploads skipped",
+                 images_uploaded, uploaded_bytes >> 20, largest_upload >> 20, layer_uploads, depth_uploads_skipped);
+        images_uploaded = uploaded_bytes = largest_upload = layer_uploads = depth_uploads_skipped = 0;
         astc_opaque_images = astc_alpha_images = 0;
         std::vector<std::pair<u32, u64>> shapes;
         for (const auto& [key, value] : created_shapes) shapes.emplace_back(value.first, key);
         std::sort(shapes.rbegin(), shapes.rend());
         for (size_t i = 0; i < std::min<size_t>(10, shapes.size()); ++i) {
             const u64 key = shapes[i].second;
-            LOG_DEBUG(HW_GPU, "  created {}x: format {} type {} levels {} layers {} {}x{} (last at {:#x})",
+            LOG_INFO(HW_GPU, "  created {}x: format {} type {} levels {} layers {} {}x{} (last at {:#x})",
                      shapes[i].first, key >> 56, (key >> 52) & 0xF, (key >> 48) & 0xF,
                      (key >> 36) & 0xFFF, (key >> 18) & 0x3FFFF, key & 0x3FFFF,
                      created_shapes[key].second);
         }
         created_shapes.clear();
         // The per-image and per-shape tallies only feed debug lines: skip them while those are off.
-        debug_stats = Common::Log::IsLevelEnabled(Common::Log::Class::HW_GPU, Common::Log::Level::Debug);
+        debug_stats = log_tc || Common::Log::IsLevelEnabled(Common::Log::Class::HW_GPU, Common::Log::Level::Debug);
         gc_deletes = gc_costly_deletes = gc_download_deletes = async_decodes_queued = 0;
         images_created = images_deleted = 0;
     }
@@ -785,15 +785,52 @@ bool TextureCache<P>::RescaleRenderTargets() {
 }
 
 template <class P>
+void TextureCache<P>::ResolveDeferredRtRefreshes() {
+    if (deferred_rt_refreshes.empty()) {
+        return;
+    }
+    const auto& regs = maxwell3d->regs;
+    const auto& clear = regs.clear_surface;
+    const auto is_deferred = [this](ImageId id) {
+        return std::ranges::find(deferred_rt_refreshes, id) != deferred_rt_refreshes.end();
+    };
+    // Only a target this clear really overwrites may skip its upload: IsFullClear looks at the
+    // area, not at which target and channels the clear selects. The others are uploaded now
+    // (their alias copies follow in PrepareImage's SynchronizeAliases).
+    for (size_t index = 0; index < NUM_RT; ++index) {
+        const ImageViewId view_id = render_targets.color_buffer_ids[index];
+        if (!view_id || slot_image_views[view_id].IsBuffer()) {
+            continue;
+        }
+        const ImageId image_id = slot_image_views[view_id].image_id;
+        if (!is_deferred(image_id)) {
+            continue;
+        }
+        const bool all_channels = clear.R && clear.G && clear.B && clear.A;
+        if (clear.RT != index || !all_channels || !IsFullClear(view_id)) {
+            RefreshContents(slot_images[image_id], image_id);
+        }
+    }
+    const ImageViewId depth_id = render_targets.depth_buffer_id;
+    if (depth_id && !slot_image_views[depth_id].IsBuffer()) {
+        const ImageId image_id = slot_image_views[depth_id].image_id;
+        if (is_deferred(image_id)) {
+            const auto type = VideoCore::Surface::GetFormatType(slot_images[image_id].info.format);
+            const bool all_aspects =
+                (clear.Z || type == VideoCore::Surface::SurfaceType::Stencil) &&
+                (clear.S || type == VideoCore::Surface::SurfaceType::Depth) &&
+                (!clear.S || regs.stencil_front_mask == 0xFF);
+            if (!all_aspects || !IsFullClear(depth_id)) {
+                RefreshContents(slot_images[image_id], image_id);
+            }
+        }
+    }
+    deferred_rt_refreshes.clear();
+}
+
+template <class P>
 void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     using namespace VideoCommon::Dirty;
-    struct ClearingScope {
-        bool& flag;
-        ~ClearingScope() {
-            flag = false;
-        }
-    } clearing_scope{clearing_render_targets};
-    clearing_render_targets = is_clear;
     auto& flags = maxwell3d->dirty.flags;
     if (!flags[Dirty::RenderTargets]) {
         for (size_t index = 0; index < NUM_RT; ++index) {
@@ -806,7 +843,11 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     }
 
     const VideoCommon::RenderTargets previous_render_targets = render_targets;
+    deferred_rt_refreshes.clear();
+    defer_rt_refresh = is_clear;
     const bool rescaled = RescaleRenderTargets();
+    defer_rt_refresh = false;
+    ResolveDeferredRtRefreshes();
     if (is_rescaling != rescaled) {
         flags[Dirty::RescaleViewports] = true;
         flags[Dirty::RescaleScissors] = true;
@@ -2703,62 +2744,42 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         DeleteImage(overlap_id);
     }
 
-    // A new render target that the clear binding it overwrites whole (every channel, the whole
-    // image) needs no upload from guest memory first: Ocarina of Time creates ~4 such targets a
-    // frame outdoors, and uploading them was ~15% of the GPU back thread.
-    const auto overwritten_by_clear = [&] {
-        if (!clearing_render_targets || !join_copies_to_do.empty() ||
-            new_info.type != ImageType::e2D || new_info.resources.levels != 1 ||
-            new_info.resources.layers != 1 || new_info.num_samples != 1) {
-            return false;
+    // A render target created while a clear binds its targets usually never needs its guest
+    // contents: leave it CpuModified, UpdateRenderTargets uploads it unless the clear overwrites
+    // all of it (ResolveDeferredRtRefreshes). Ocarina of Time creates ~4-7 such targets a frame
+    // outdoors, uploading them was ~15% of the GPU back thread. Images that receive non-alias
+    // copies below must be uploaded first, or the upload would overwrite the copies. Alias copies
+    // can wait as well: when the clear does not overwrite the image, PrepareImage runs
+    // RefreshContents and SynchronizeAliases. Overlaps merged into it can't, they get deleted.
+    const bool deferred_refresh =
+        defer_rt_refresh && std::ranges::all_of(join_copies_to_do, [](const JoinCopy& copy) {
+            return copy.is_alias;
+        });
+    // EDEN_NX2_SKIP_DEPTH_UPLOAD=0: a new depth or stencil image is uploaded from guest memory
+    // like any other. The CPU writes no depth: what those pages hold is what an earlier image at
+    // the address left before it was deleted. Pages a copy or dispatch wrote are still uploaded.
+    static const bool skip_depth_uploads = [] {
+        const char* value = std::getenv("EDEN_NX2_SKIP_DEPTH_UPLOAD");
+        return value == nullptr || value[0] != '0';
+    }();
+    const auto surface_type = VideoCore::Surface::GetFormatType(new_info.format);
+    bool fresh_depth = skip_depth_uploads && join_copies_to_do.empty() &&
+                       (surface_type == VideoCore::Surface::SurfaceType::Depth ||
+                        surface_type == VideoCore::Surface::SurfaceType::Stencil ||
+                        surface_type == VideoCore::Surface::SurfaceType::DepthStencil);
+    for (DAddr page = cpu_addr & ~DAddr{0xfff};
+         fresh_depth && page < cpu_addr + new_image.guest_size_bytes; page += 0x1000) {
+        fresh_depth = !Tegra::Nx2IsGpuWritten(page);
+    }
+    if (fresh_depth) {
+        new_image.flags &= ~ImageFlagBits::CpuModified;
+        if (False(new_image.flags & ImageFlagBits::Tracked)) {
+            TrackImage(new_image, new_image_id);
         }
-        const auto& regs = maxwell3d->regs;
-        const auto& surface = regs.clear_surface;
-        if (surface.layer != 0) {
-            return false;
-        }
-        const u32 width = new_info.size.width;
-        const u32 height = new_info.size.height;
-        if (regs.clear_control.use_scissor != 0) {
-            const auto& scissor = regs.scissor_test[0];
-            if (scissor.min_x != 0 || scissor.min_y != 0 || scissor.max_x < width ||
-                scissor.max_y < height) {
-                return false;
-            }
-        }
-        // The clear covers the framebuffer's render area, the smallest bound target.
-        for (u32 index = 0; index < regs.rt_control.count && index < NUM_RT; ++index) {
-            const auto& rt = regs.rt[index];
-            if (rt.Address() != 0 && rt.format != Tegra::RenderTargetFormat::NONE &&
-                (rt.width < width || rt.height < height)) {
-                return false;
-            }
-        }
-        if (regs.zeta_enable && regs.zeta.Address() != 0 &&
-            (regs.zeta_size.width < width || regs.zeta_size.height < height)) {
-            return false;
-        }
-        const bool is_depth_target = regs.zeta_enable && regs.zeta.Address() == gpu_addr;
-        const bool full_stencil = surface.S && regs.stencil_front_mask == 0xFF;
-        switch (VideoCore::Surface::GetFormatType(new_info.format)) {
-        case VideoCore::Surface::SurfaceType::ColorTexture: {
-            const u32 index = surface.RT;
-            return surface.R && surface.G && surface.B && surface.A && index < NUM_RT &&
-                   index < regs.rt_control.count && regs.rt[index].Address() == gpu_addr;
-        }
-        case VideoCore::Surface::SurfaceType::Depth:
-            return is_depth_target && surface.Z;
-        case VideoCore::Surface::SurfaceType::Stencil:
-            return is_depth_target && full_stencil;
-        case VideoCore::Surface::SurfaceType::DepthStencil:
-            return is_depth_target && surface.Z && full_stencil;
-        default:
-            return false;
-        }
-    };
-    if (overwritten_by_clear()) {
-        // Stays CpuModified: UpdateRenderTargets' PrepareImage drops the upload only when
-        // IsFullClear agrees the clear covers the whole image, and uploads it otherwise.
+        runtime.TransitionImageLayout(new_image);
+        ++depth_uploads_skipped;
+    } else if (deferred_refresh) {
+        deferred_rt_refreshes.push_back(new_image_id);
         runtime.TransitionImageLayout(new_image);
     } else {
         // TODO: Only upload what we need
@@ -2813,6 +2834,9 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     for (const auto& copy_object : join_copies_to_do) {
         Image& overlap = slot_images[copy_object.id];
         if (copy_object.is_alias) {
+            if (deferred_refresh) {
+                continue;
+            }
             if (!overlap.IsSafeGpuCopy()) {
                 continue;
             }
