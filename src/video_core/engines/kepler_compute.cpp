@@ -1110,7 +1110,154 @@ struct KeplerCompute::FrontState {
     bool compute_uploaded{};
     u32 bind_pointer{};
     MacroEngine* macro{}; ///< Without a native context: the one macro engine
+    NativeQmdScheduler qmd{true};
+    bool qmd_unknown{};
+    GPUVAddr upload_dest{};
+    u32 upload_length{}, upload_pitch{}, upload_offset{};
+    bool upload_noted{};
 };
+
+// Mirrors the back's QMD scheduling to note the semaphore releases it will make, with their
+// values, as queued writes (GpuSplit::NoteMemoryWriteData): the puller's acquires on them need
+// not wait for the back (Puller::PredictedMet). A descriptor is read from memory with the queued
+// writes the front knows laid over it: the register copy of an inline QMD until the back writes
+// it, and the 4-byte uploads the game patches payloads with up to the launch.
+void KeplerCompute::FrontSignalQmd(FrontState& fs, VideoCommon::GpuSplit& split, GPUVAddr address,
+                                   u32 argument) {
+    fs.qmd_unknown = false;
+    static u64 signals{}, errors{}, unknown{};
+    const std::string_view error = fs.qmd.Signal(
+        address, argument,
+        [&](u64 qmd_address, NativeQmdScheduler::Descriptor& descriptor) {
+            if (!memory_manager.IsFullyMappedRange(qmd_address, sizeof(descriptor))) {
+                return false;
+            }
+            const auto device = memory_manager.GpuToCpuAddress(qmd_address);
+            const u64 since = split.ConsumedNow();
+            memory_manager.ReadBlockUnsafe(qmd_address, descriptor.data(), sizeof(descriptor));
+            if (!device || !split.OverlayQueuedWrites(since, *device, descriptor.data(),
+                                                      static_cast<u32>(descriptor.size()))) {
+                fs.qmd_unknown = true;
+            }
+            return true;
+        },
+        [&](u64 destination, u32 payload, u32 flags) {
+            const auto device = memory_manager.GpuToCpuAddress(destination);
+            if (!device) {
+                return true;
+            }
+            split.NoteReportWrite(*device, 4);
+            if (fs.qmd_unknown) {
+                split.NoteMemoryWrite(*device, 4, "QMD release");
+                return true;
+            }
+            u32 value = payload;
+            if (flags & ((1U << 26) | (1U << 19))) {
+                const u64 since = split.ConsumedNow();
+                u32 current = memory_manager.Read<u32>(destination);
+                if (!split.OverlayQueuedWrites(since, *device, &current, 1)) {
+                    split.NoteMemoryWrite(*device, 4, "QMD release");
+                    return true;
+                }
+                value = (flags & (1U << 26)) ? current + payload : (std::max)(current, payload);
+            }
+            split.NoteMemoryWriteData(*device, &value, 1);
+            return true;
+        },
+        [](const NativeQmdScheduler::Descriptor&) { return true; });
+    errors += !error.empty();
+    unknown += fs.qmd_unknown;
+    if (++signals % 4096 == 0) {
+        LOG_INFO(HW_GPU, "NX2 QMD mirror last 4096 signals: {} errors (last: {}), {} unknown",
+                 errors, error, unknown);
+        errors = unknown = 0;
+    }
+}
+
+void KeplerCompute::FrontNoteUploadWords(FrontState& fs, VideoCommon::GpuSplit& split,
+                                         const u32* words, u32 count) {
+    if (!fs.upload_noted || fs.upload_length == 0) {
+        return;
+    }
+    while (count != 0) {
+        const u32 line = fs.upload_offset / fs.upload_length;
+        const u32 column = fs.upload_offset % fs.upload_length;
+        const u32 run = (std::min)(count, (fs.upload_length - column) / 4);
+        if (run == 0) {
+            return;
+        }
+        if (const auto device = memory_manager.GpuToCpuAddress(
+                fs.upload_dest + u64{line} * fs.upload_pitch + column)) {
+            split.NoteMemoryWriteData(*device, words, run);
+        }
+        fs.upload_offset += run * 4;
+        words += run;
+        count -= run;
+    }
+}
+
+// After the method was sent to the back: the guest memory writes it queues, with their words
+// when the front knows them, and the QMD signals the mirror follows.
+void KeplerCompute::FrontNoteRelease(FrontState& fs, VideoCommon::GpuSplit& split, u32 method,
+                                     u32 argument) {
+    switch (method) {
+    case 0x6c: {
+        fs.upload_dest = (GPUVAddr{fs.registers[0x62]} << 32) | fs.registers[0x63];
+        fs.upload_length = fs.registers[0x60];
+        fs.upload_pitch = fs.registers[0x64];
+        fs.upload_offset = 0;
+        const u64 lines = (std::max)(fs.registers[0x61], 1U);
+        const u64 size =
+            u64{(std::max)(fs.upload_pitch, fs.upload_length)} * (lines - 1) + fs.upload_length;
+        fs.upload_noted = (argument & 1) == 1 && size <= 1024;
+        if (!fs.upload_noted && size != 0) {
+            if (const auto device = memory_manager.GpuToCpuAddress(fs.upload_dest)) {
+                split.NoteMemoryWrite(*device, size, "compute upload");
+            }
+        }
+        return;
+    }
+    case 0x6d:
+        FrontNoteUploadWords(fs, split, &argument, 1);
+        return;
+    case 0x6c3: {
+        if ((argument & 3) != 0 || ((argument >> 3) & 1) != 0) {
+            return;
+        }
+        const GPUVAddr address =
+            (GPUVAddr{fs.registers[0x6c0] & 0x1ffffff} << 32) | fs.registers[0x6c1];
+        if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+            const u32 payload = fs.registers[0x6c2];
+            split.NoteMemoryWriteData(*device, &payload, 1);
+            split.NoteReportWrite(*device, 4);
+        }
+        return;
+    }
+    case 0x107: {
+        const GPUVAddr address = ((GPUVAddr{fs.registers[0xc6]} << 32) | fs.registers[0xc7]) << 8;
+        if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+            split.NoteMemoryWriteData(*device, &fs.registers[0xc8], 64);
+        }
+        if ((fs.registers[0xa7] & (1U << 24)) || !(fs.registers[0xcc] & (1U << 12))) {
+            FrontSignalQmd(fs, split, address, 3);
+        }
+        return;
+    }
+    case 0xae:
+    case 0xaf:
+    case 0xb0: {
+        const u32 action = argument & 15;
+        if (method == 0xae || (method == 0xaf && !(argument & 2)) ||
+            (method == 0xb0 && (action == 0 || action == 1))) {
+            return;
+        }
+        FrontSignalQmd(fs, split, GPUVAddr{fs.registers[0xad]} << 8, argument);
+        return;
+    }
+    default:
+        return;
+    }
+}
 
 KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
     if (!front) [[unlikely]] {
@@ -1199,6 +1346,7 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
     }
     FrontApply(fs, method, argument);
     split.Method(this, method, argument, is_last_call, segment);
+    FrontNoteRelease(fs, split, method, argument);
 }
 
 void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split,
@@ -1217,6 +1365,13 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
         }
     }
     split.MultiMethod(this, method, base_start, amount, methods_pending, segment);
+    if (method == 0x6d) {
+        FrontNoteUploadWords(fs, split, base_start, amount);
+    } else if (method < fs.registers.size()) {
+        for (u32 i = 0; i < amount; ++i) {
+            FrontNoteRelease(fs, split, method, base_start[i]);
+        }
+    }
 }
 
 void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
@@ -1238,6 +1393,7 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         }
         FrontApply(fs, address, value);
         split.MacroWrite(this, address, value);
+        FrontNoteRelease(fs, split, address, value);
         return true;
     };
 #ifdef ARCHITECTURE_x86_64

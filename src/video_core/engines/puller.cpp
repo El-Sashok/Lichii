@@ -64,6 +64,66 @@ void DrainBack() {
     VideoCommon::GpuSplit::Get().Drain(VideoCommon::DrainSite::Acquire);
 }
 
+std::atomic<u64> g_acquire_checks{};
+std::atomic<u64> g_acquire_predicted{};
+std::atomic<u64> g_acquire_predicted_wrong{};
+
+bool AcquireMatches(u32 operation, u32 value, u32 current) {
+    switch (operation) {
+    case 0x1: // AcquireEqual
+        return current == value;
+    case 0x4: // AcquireGequal
+        return current >= value;
+    case 0x8: // AcquireMask
+        return (current & value) != 0;
+    default:
+        return false;
+    }
+}
+
+// A GPU release still queued for the back whose value meets the acquire (a fence payload or a
+// QMD release the front noted with its words): the back runs it in order before anything this
+// channel sends next, so the front does not wait for it. Only a queued write counts, never the
+// value guest memory holds now. The back checks the value where the acquire was.
+bool PredictedMet(DmaPusher& dma_pusher, GPUVAddr address, u32 value, u32 operation,
+                  bool count) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("EDEN_NX2_PREDICT_ACQUIRES");
+        return env == nullptr || env[0] != '0';
+    }();
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (count && g_acquire_checks.fetch_add(1, std::memory_order_relaxed) % 4096 == 4095) {
+        LOG_INFO(HW_GPU, "NX2 acquires last 4096: {} predicted ({} wrong), {} drained",
+                 g_acquire_predicted.load(), g_acquire_predicted_wrong.exchange(0),
+                 4096 - g_acquire_predicted.exchange(0));
+    }
+    if (!enabled || !split.Active()) {
+        return false;
+    }
+    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
+    if (!device) {
+        return false;
+    }
+    const u64 since = split.ConsumedNow();
+    const u32 memory_word = dma_pusher.memory_manager.Read<u32>(address);
+    u32 word = memory_word;
+    if (!split.OverlayQueuedWrites(since, *device, &word, 1) ||
+        !AcquireMatches(operation, value, word)) {
+        return false;
+    }
+    if (word == memory_word && dma_pusher.rasterizer->MustFlushRegion(
+                                   *device, sizeof(u32), VideoCommon::CacheType::BufferCache)) {
+        return false;
+    }
+    g_acquire_predicted.fetch_add(1, std::memory_order_relaxed);
+    split.Defer([memory = &dma_pusher.memory_manager, address, value, operation] {
+        if (!AcquireMatches(operation, value, memory->Read<u32>(address))) {
+            g_acquire_predicted_wrong.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+    return true;
+}
+
 // The fence manager records into the scheduler and downloads the CPU's writes over GPU data:
 // the back's state, which a drained back still uses from its idle hook (it submits).
 void ReleaseFences(DmaPusher& dma_pusher) {
@@ -89,6 +149,10 @@ bool Puller::PendingAcquire::Matches(u32 current) const {
 
 bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     if (!pending_acquire) {
+        return true;
+    }
+    if (PredictedMet(dma_pusher, pending_acquire->address, pending_acquire->value,
+                     pending_acquire->operation, false)) {
         return true;
     }
     // The release may still be queued for the split GPU thread's back half (and the caches
@@ -259,6 +323,9 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             return;
         }
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
+        if (PredictedMet(dma_pusher, acquire.address, acquire.value, acquire.operation, true)) {
+            return;
+        }
         DrainBack();
         if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
             return;

@@ -13,6 +13,8 @@ namespace Tegra {
 // Native QMD 3.0 dependency scheduling; nonempty grids require a dispatch backend.
 class NativeQmdScheduler {
 public:
+    /// The split GPU thread's front mirrors the back's scheduling in a table of its own.
+    explicit NativeQmdScheduler(bool front = false) : states{front ? front_states : back_states} {}
     using Word = std::uint32_t;
     using Address = std::uint64_t;
     using Descriptor = std::array<Word, 64>;
@@ -134,6 +136,8 @@ private:
     // One table for every channel: a QMD's dependency counter is state of the QMD itself, and
     // title 1 schedules a QMD on one channel while another decrements it (a decrement that
     // arrived first was kept by the other channel's scheduler and the QMD never launched).
-    static inline std::unordered_map<Address, State> states;
+    static inline std::unordered_map<Address, State> front_states;
+    static inline std::unordered_map<Address, State> back_states;
+    std::unordered_map<Address, State>& states;
 };
 } // namespace Tegra

@@ -272,6 +272,12 @@ private:
     MacroEngine& FrontMacroEngine(FrontState& state);
     std::span<u32> FrontMacroPositions(FrontState& state);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
+    void FrontNoteRelease(FrontState& state, VideoCommon::GpuSplit& split, u32 method,
+                          u32 argument);
+    void FrontSignalQmd(FrontState& state, VideoCommon::GpuSplit& split, GPUVAddr address,
+                        u32 argument);
+    void FrontNoteUploadWords(FrontState& state, VideoCommon::GpuSplit& split, const u32* words,
+                              u32 count);
     std::unique_ptr<FrontState> front;
     bool front_macros{}; ///< The front owns the macro code and bindings (the back skips them)
 
