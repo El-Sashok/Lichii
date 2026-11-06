@@ -31,6 +31,18 @@
 
 namespace Tegra {
 
+namespace {
+// EDEN_NX2_LIST_SYNCED_WRITERS=0: command lists wait for every queued dispatch and copy before
+// their GPU-written check, instead of those sent before the guest's last sync.
+bool SyncedListWriters() {
+    static const bool synced = [] {
+        const char* value = std::getenv("EDEN_NX2_LIST_SYNCED_WRITERS");
+        return value == nullptr || value[0] != '0';
+    }();
+    return synced;
+}
+} // Anonymous namespace
+
 constexpr u32 MacroRegistersStart = 0xE00;
 constexpr u32 ComputeInline = 0x6D;
 
@@ -199,7 +211,8 @@ bool DmaPusher::Step() {
         const bool use_safe = !VideoCommon::GpuSplit::Get().Active() &&
                               (Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe());
         if (!gpu_written && VideoCommon::GpuSplit::Get().Active() &&
-            VideoCommon::GpuSplit::Get().WaitForWriters()) {
+            (SyncedListWriters() ? VideoCommon::GpuSplit::Get().WaitForSyncedWriters()
+                                 : VideoCommon::GpuSplit::Get().WaitForWriters())) {
             gpu_written =
                 IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
         }
@@ -652,7 +665,11 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
     }
     auto& split = VideoCommon::GpuSplit::Get();
     if (split.Active()) {
-        split.WaitForWriters();
+        if (SyncedListWriters()) {
+            split.WaitForSyncedWriters();
+        } else {
+            split.WaitForWriters();
+        }
     }
     bool past_sync = !split.Active();
     using GpuWrittenList = VideoCore::RasterizerInterface::GpuWrittenList;

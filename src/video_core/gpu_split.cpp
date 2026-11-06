@@ -225,6 +225,11 @@ bool GpuSplit::WaitForWriters() {
     return WaitFor(std::min(last_writer_position, write_position), DrainSite::ListWriters);
 }
 
+bool GpuSplit::WaitForSyncedWriters() {
+    return WaitFor(std::min({last_writer_position, last_sync_position, write_position}),
+                   DrainSite::ListWriters);
+}
+
 bool GpuSplit::WaitForWritesTo(u64 begin, u64 size) {
     consumed_cache = consumed.load(std::memory_order_acquire);
     const u64 end = begin + size;

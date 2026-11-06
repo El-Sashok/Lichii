@@ -168,6 +168,9 @@ public:
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
     /// Returns whether any of it was still queued.
     bool WaitForWriters();
+    /// Waits until the back executed the compute and copy work sent before the last NoteSync:
+    /// what the guest can have waited for, so the only GPU writes its commands may depend on.
+    bool WaitForSyncedWriters();
     /// Work that writes the device range [begin, begin + size) was just sent (an inline upload, a
     /// report, a semaphore release). size ~0 means an unknown range.
     void NoteMemoryWrite(u64 begin, u64 size, const char* what = "unknown") {
