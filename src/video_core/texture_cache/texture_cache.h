@@ -144,7 +144,7 @@ void TextureCache<P>::RunGarbageCollector() {
         // EDEN_NX2_TC_MIN_AGE=<frames>: never evict images used more recently (thrash tests).
         static const u64 min_age = [] {
             const char* value = std::getenv("EDEN_NX2_TC_MIN_AGE");
-            return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
+            return value != nullptr ? std::strtoull(value, nullptr, 10) : 150ULL;
         }();
         ticks_to_destroy = (std::max)(ticks_to_destroy, min_age);
         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);
@@ -260,8 +260,14 @@ template <class P>
 void TextureCache<P>::ApplyThresholdOverrides(bool log) {
     // On every GPU: past what a frame needs, more device memory only keeps the textures of earlier
     // scenes (title 1 filled 6.7 GB of an 8 GB card and draws its races in ~5 GB), so collect from
-    // MaxCriticalMemory on rather than near the card's budget.
-    critical_memory = (std::min)(critical_memory, MaxCriticalMemory);
+    // MaxCriticalMemory on rather than near the card's budget. A card with more than that to
+    // spare keeps three quarters of its memory: collecting at 5 GiB downloads every evicted render
+    // target with a host wait (Ocarina of Time holds ~7 GiB of transient targets).
+    u64 max_critical = MaxCriticalMemory;
+    if constexpr (HAS_DEVICE_MEMORY_INFO) {
+        max_critical = (std::max)(max_critical, runtime.GetDeviceLocalMemory() / 4 * 3);
+    }
+    critical_memory = (std::min)(critical_memory, max_critical);
     expected_memory =
         (std::min)(expected_memory, critical_memory - (std::min)(critical_memory, u64{768_MiB}));
     minimum_memory =
