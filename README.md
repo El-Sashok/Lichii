@@ -10,6 +10,9 @@
   <img src="dist/branding/lichii_icon_with_logo.png" alt="Lichii" width="600">
 </p>
 
+> This fork's branch `oot-nx2` carries performance work for The Legend of Zelda: Ocarina of Time
+> (2026). What it changes, how to build and run it, and how it is measured: [OOT_NX2.md](OOT_NX2.md).
+
 # Lichii
 
 Lichii is an experimental, open-source Nintendo Switch and Switch 2 emulator written in C++. It builds on Eglantine, Eden, yuzu and Sudachi, preserving their contributions while developing this fork's game compatibility and renderer fixes.
