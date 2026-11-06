@@ -27,6 +27,7 @@
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/renderer_vulkan/vk_command_pool.h"
+#include "video_core/nx2.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -247,16 +248,18 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
     const bool profile = VideoCommon::Nx2Profile::Enabled();
-    const u64 start = profile ? VideoCommon::Nx2Profile::Now() : 0;
+    const u64 start = VideoCommon::Nx2Profile::Now();
     SubmitExecution(signal_semaphore, wait_semaphore);
     Wait(presubmit_tick);
     AllocateNewContext();
     last_flush = std::chrono::steady_clock::now();
     flush_pending = false;
+    const u64 finish_ns = VideoCommon::Nx2Profile::Now() - start;
+    Tegra::g_nx2_finishes.fetch_add(1, std::memory_order_relaxed);
+    Tegra::g_nx2_finish_ns.fetch_add(finish_ns, std::memory_order_relaxed);
     if (profile) {
         g_profile_finishes.fetch_add(1, std::memory_order_relaxed);
-        g_profile_finish_ns.fetch_add(VideoCommon::Nx2Profile::Now() - start,
-                                      std::memory_order_relaxed);
+        g_profile_finish_ns.fetch_add(finish_ns, std::memory_order_relaxed);
     }
 }
 

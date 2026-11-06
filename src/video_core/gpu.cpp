@@ -233,10 +233,15 @@ struct GPU::Impl {
         raster_area.preemtive = true;
         // A guest CPU read of GPU-written memory (reactive flushing): count them, they decide
         // whether buffer data must be copied back at every fence (EDEN_NX2_BUFFER_DOWNLOADS).
-        if (static std::atomic<u64> reads{}; (reads.fetch_add(1, std::memory_order_relaxed) & 63) == 0) {
+        if ((g_nx2_cpu_read_flushes.fetch_add(1, std::memory_order_relaxed) & 63) == 0) {
             LOG_INFO(HW_GPU, "CPU read of GPU-written memory [{:#x}, {:#x}) ({} so far)",
                      raster_area.start_address, raster_area.end_address,
-                     reads.load(std::memory_order_relaxed));
+                     g_nx2_cpu_read_flushes.load(std::memory_order_relaxed));
+        }
+        if (renderer->ReadRasterizer()->WaitForFenceDownload(
+                raster_area.start_address, raster_area.end_address - raster_area.start_address)) {
+            g_nx2_read_wait_hits.fetch_add(1, std::memory_order_relaxed);
+            return raster_area;
         }
         const u64 fence = RequestSyncOperation([this, raster_area]() {
             // Apply collected guest writes before downloading GPU data over guest memory.

@@ -283,7 +283,12 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
                                            device_addr_end_aligned - device_addr_start_aligned);
     // A preflushable mark persists and downloads later GPU writes at every fence. Native titles
     // instead keep read traps and flush on demand.
-    const bool preflush = !Tegra::g_nx2_ampere.load(std::memory_order_relaxed);
+    static const int preflush_env = [] {
+        const char* value = std::getenv("EDEN_NX2_PREFLUSH");
+        return value == nullptr ? -1 : (value[0] == '1' ? 1 : 0);
+    }();
+    const bool preflush = preflush_env >= 0 ? preflush_env == 1
+                                            : !Tegra::g_nx2_ampere.load(std::memory_order_relaxed);
     if (!area->preemtive) {
         if (Nx2DownloadTrace::g_enabled) [[unlikely]] {
             Nx2DownloadTrace::Marked(device_addr_start_aligned,
@@ -296,6 +301,14 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
             if constexpr (USE_MEMORY_MAPS) {
                 cpu_read_ranges.Add(area->start_address, area->end_address - area->start_address);
                 download_cpu_read_ranges = true;
+                const auto now = std::chrono::steady_clock::now();
+                for (DAddr page = device_addr_start_aligned; page < device_addr_end_aligned;
+                     page += Core::DEVICE_PAGESIZE) {
+                    ReadPage& entry = cpu_read_pages[page];
+                    entry.previous = entry.last;
+                    entry.last = now;
+                    ++entry.count;
+                }
             }
             // The core consumed this trap before GetFlushArea. Forget it so the next GPU write
             // really rearms the core instead of being skipped by the deduplication cache.
@@ -317,9 +330,15 @@ void BufferCache<P>::DownloadMemory(DAddr device_addr, u64 size) {
         if (download_cpu_read_ranges) {
             download_cpu_read_ranges = false;
             boost::container::small_vector<std::pair<DAddr, u64>, 16> ranges{{device_addr, size}};
+            const auto now = std::chrono::steady_clock::now();
+            const bool hot_only = HotReadWindow().count() > 0;
             cpu_read_ranges.ForEach([&](DAddr lower, DAddr upper) {
                 gpu_modified_ranges.ForEachInRange(lower, upper - lower,
                                                    [&](DAddr start, DAddr end) {
+                                                       if (hot_only &&
+                                                           !IsHotReadPage(Common::AlignDown(start, Core::DEVICE_PAGESIZE), now)) {
+                                                           return;
+                                                       }
                                                        ranges.emplace_back(start, end - start);
                                                    });
             });

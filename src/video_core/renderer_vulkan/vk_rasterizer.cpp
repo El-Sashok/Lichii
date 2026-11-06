@@ -5,8 +5,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
-#include <array>
 #include <chrono>
+#include <thread>
+#include <array>
 #include <memory>
 #include <limits>
 #include <cstdio>
@@ -52,6 +53,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/nx2.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
@@ -1614,6 +1616,40 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
     return new_area;
 }
 
+bool RasterizerVulkan::WaitForFenceDownload(DAddr addr, u64 size) {
+    const auto start = std::chrono::steady_clock::now();
+    const auto deadline = start + std::chrono::milliseconds{20};
+    bool seen_pending = false;
+    while (true) {
+        {
+            std::scoped_lock lock{buffer_cache.mutex};
+            if (!buffer_cache.IsGpuModifiedRange(addr, size)) {
+                if (!seen_pending) {
+                    Tegra::g_nx2_read_clean.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    Tegra::g_nx2_read_wait_ns.fetch_add(
+                        static_cast<u64>((std::chrono::steady_clock::now() - start).count()),
+                        std::memory_order_relaxed);
+                }
+                return seen_pending;
+            }
+            if (!buffer_cache.IsFenceDownloadPending(addr, size)) {
+                buffer_cache.CountReadMiss(addr, size);
+                (buffer_cache.IsHotReadRange(addr, size) ? Tegra::g_nx2_read_hot_miss
+                                                         : Tegra::g_nx2_read_cold)
+                    .fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            seen_pending = true;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            Tegra::g_nx2_read_timeout.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds{50});
+    }
+}
+
 void RasterizerVulkan::PrepareRegionWrite(DAddr addr, u64 size, VideoCommon::CacheType which) {
     if (addr == 0 || size == 0 || False(which & VideoCommon::CacheType::BufferCache)) {
         return;
@@ -1994,9 +2030,40 @@ void RasterizerVulkan::TickFrame() {
         const auto now = std::chrono::steady_clock::now();
         if (trace_cpu_rate.Ready(now)) {
             auto snapshot = Common::DkbCpuTrace::ReadSnapshot();
+            const u64 finishes = Tegra::g_nx2_finishes.load(std::memory_order_relaxed);
+            const u64 finish_ns = Tegra::g_nx2_finish_ns.load(std::memory_order_relaxed);
+            const u64 cpu_read_flushes = Tegra::g_nx2_cpu_read_flushes.load(std::memory_order_relaxed);
+            const u64 read_wait_hits = Tegra::g_nx2_read_wait_hits.load(std::memory_order_relaxed);
+            const u64 read_wait_ns = Tegra::g_nx2_read_wait_ns.load(std::memory_order_relaxed);
+            std::array<u64, 5> read_miss_ages{};
+            for (size_t i = 0; i < read_miss_ages.size(); ++i) {
+                read_miss_ages[i] = Tegra::g_nx2_read_miss_ages[i].load(std::memory_order_relaxed);
+            }
+            const std::array<u64, 4> read_misses{
+                Tegra::g_nx2_read_clean.load(std::memory_order_relaxed),
+                Tegra::g_nx2_read_hot_miss.load(std::memory_order_relaxed),
+                Tegra::g_nx2_read_cold.load(std::memory_order_relaxed),
+                Tegra::g_nx2_read_timeout.load(std::memory_order_relaxed)};
             if (trace_cpu_snapshot && trace_frame > trace_cpu_frame) {
                 const u64 frames = trace_frame - trace_cpu_frame;
-                std::string roles;
+                std::string roles = fmt::format(
+                    " finishes={} finish_ms={:.3f} cpu_read_flushes={} read_waits={}",
+                    finishes - trace_finishes,
+                    static_cast<double>(finish_ns - trace_finish_ns) / 1e6,
+                    cpu_read_flushes - trace_cpu_read_flushes, read_wait_hits - trace_read_wait_hits);
+                roles += fmt::format(" miss_ages={}/{}/{}/{}/{}",
+                                     read_miss_ages[0] - trace_read_miss_ages[0],
+                                     read_miss_ages[1] - trace_read_miss_ages[1],
+                                     read_miss_ages[2] - trace_read_miss_ages[2],
+                                     read_miss_ages[3] - trace_read_miss_ages[3],
+                                     read_miss_ages[4] - trace_read_miss_ages[4]);
+                roles += fmt::format(" read_wait_ms={:.3f}",
+                                     static_cast<double>(read_wait_ns - trace_read_wait_ns) / 1e6);
+                roles += fmt::format(" read_clean={} read_hot_miss={} read_cold={} read_timeout={}",
+                                     read_misses[0] - trace_read_misses[0],
+                                     read_misses[1] - trace_read_misses[1],
+                                     read_misses[2] - trace_read_misses[2],
+                                     read_misses[3] - trace_read_misses[3]);
                 for (size_t i = 0; i < Common::DkbCpuTrace::RoleCount; ++i) {
                     const auto name = Common::DkbCpuTrace::RoleNames[i];
                     const auto delta = Common::DkbCpuTrace::CpuTimeDelta(
@@ -2019,6 +2086,13 @@ void RasterizerVulkan::TickFrame() {
             }
             trace_cpu_snapshot = std::move(snapshot);
             trace_cpu_frame = trace_frame;
+            trace_finishes = finishes;
+            trace_finish_ns = finish_ns;
+            trace_cpu_read_flushes = cpu_read_flushes;
+            trace_read_wait_hits = read_wait_hits;
+            trace_read_misses = read_misses;
+            trace_read_wait_ns = read_wait_ns;
+            trace_read_miss_ages = read_miss_ages;
         }
         ++trace_window_frames;
         if (trace_sample_frame) {

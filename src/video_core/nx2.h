@@ -90,6 +90,19 @@ inline void Nx2ClearGpuWrittenPages() {
     return (g_nx2_gpu_written_pages[page / 64].load(std::memory_order_relaxed) >> (page % 64)) & 1;
 }
 
+/// Host GPU waits (Scheduler::Finish) and guest CPU reads of GPU-written memory that flushed.
+inline std::atomic<u64> g_nx2_finishes{};
+inline std::atomic<u64> g_nx2_finish_ns{};
+inline std::atomic<u64> g_nx2_cpu_read_flushes{};
+inline std::atomic<u64> g_nx2_read_wait_hits{};
+inline std::atomic<u64> g_nx2_read_clean{};
+inline std::atomic<u64> g_nx2_read_hot_miss{};
+inline std::atomic<u64> g_nx2_read_cold{};
+inline std::atomic<u64> g_nx2_read_timeout{};
+inline std::atomic<u64> g_nx2_read_wait_ns{};
+/// Reads that flushed by age of the page's previous read: first read, < 1.5 s, < 5 s, < 15 s, more.
+inline std::array<std::atomic<u64>, 5> g_nx2_read_miss_ages{};
+
 inline constexpr size_t Nx2MaxSemaphoreRegions = 32;
 inline std::array<std::atomic<u64>, Nx2MaxSemaphoreRegions> g_nx2_semaphore_regions{}; // starts
 

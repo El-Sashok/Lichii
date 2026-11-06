@@ -111,6 +111,7 @@ public:
     bool MustFlushRegion(DAddr addr, u64 size,
                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
+    bool WaitForFenceDownload(DAddr addr, u64 size) override;
     bool HasPendingQueries(DAddr addr, u64 size) override;
     void InvalidateRegion(DAddr addr, u64 size,
                           VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
@@ -296,6 +297,13 @@ private:
     Common::DkbFrameTrace::RateLimit trace_cpu_rate;
     std::optional<Common::DkbCpuTrace::Snapshot> trace_cpu_snapshot;
     u64 trace_cpu_frame{};
+    u64 trace_finishes{};
+    u64 trace_finish_ns{};
+    u64 trace_cpu_read_flushes{};
+    u64 trace_read_wait_hits{};
+    std::array<u64, 4> trace_read_misses{};
+    u64 trace_read_wait_ns{};
+    std::array<u64, 5> trace_read_miss_ages{};
     bool trace_sample_frame{true};
     u64 trace_frame{};
     u64 trace_window_frames{};

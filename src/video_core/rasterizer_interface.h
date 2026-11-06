@@ -128,6 +128,12 @@ public:
 
     virtual RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) = 0;
 
+    /// A guest CPU read of GPU-written buffer memory that a fence is already copying back waits
+    /// for that copy here instead of flushing. False when nothing is in flight for the range.
+    virtual bool WaitForFenceDownload([[maybe_unused]] DAddr addr, [[maybe_unused]] u64 size) {
+        return false;
+    }
+
     /// Whether reports in the range wait for host query results not yet in guest memory.
     [[nodiscard]] virtual bool HasPendingQueries([[maybe_unused]] DAddr addr,
                                                  [[maybe_unused]] u64 size) {

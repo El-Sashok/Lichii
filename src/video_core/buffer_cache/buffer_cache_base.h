@@ -10,12 +10,14 @@
 #include <cstdlib>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <numeric>
 #include <optional>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -35,6 +37,7 @@
 #include "common/slot_vector.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/buffer_cache/buffer_base.h"
+#include "video_core/nx2.h"
 #include "video_core/buffer_cache/read_trap_tracker.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
 #include "video_core/control/channel_state_cache.h"
@@ -261,6 +264,70 @@ public:
     void DownloadMemory(DAddr device_addr, u64 size);
 
     std::optional<VideoCore::RasterizerDownloadArea> GetFlushArea(DAddr device_addr, u64 size);
+
+    bool IsGpuModifiedRange(DAddr device_addr, u64 size) const {
+        return gpu_modified_ranges.Intersects(device_addr, size);
+    }
+
+    /// Counts a read that found no copy in flight by the age of the page's previous read.
+    void CountReadMiss(DAddr device_addr, u64 size) const {
+        const auto now = std::chrono::steady_clock::now();
+        for (DAddr page = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
+             page < device_addr + size; page += Core::DEVICE_PAGESIZE) {
+            const auto it = cpu_read_pages.find(page);
+            size_t bucket = 0;
+            if (it != cpu_read_pages.end() && it->second.count >= 2) {
+                const auto age = now - it->second.previous;
+                bucket = age < std::chrono::milliseconds{1500} ? 1
+                         : age < std::chrono::seconds{5}      ? 2
+                         : age < std::chrono::seconds{15}     ? 3
+                                                              : 4;
+            }
+            Tegra::g_nx2_read_miss_ages[bucket].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    bool IsHotReadRange(DAddr device_addr, u64 size) const {
+        const auto now = std::chrono::steady_clock::now();
+        for (DAddr page = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
+             page < device_addr + size; page += Core::DEVICE_PAGESIZE) {
+            if (IsHotReadPage(page, now)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Whether every GPU-modified byte of the range is in a download a fence has taken and not
+    /// popped yet (a write after the copy removes its range from those downloads).
+    bool IsFenceDownloadPending(DAddr device_addr, u64 size) const {
+        bool pending = true;
+        gpu_modified_ranges.ForEachInRange(device_addr, size, [&](DAddr lower, DAddr upper) {
+            lower = (std::max)(lower, device_addr);
+            upper = (std::min)(upper, device_addr + size);
+            Common::RangeSet<DAddr> covered;
+            const auto collect = [&](const Common::RangeSet<DAddr>& ranges) {
+                ranges.ForEachInRange(lower, upper - lower, [&](DAddr start, DAddr end) {
+                    start = (std::max)(start, lower);
+                    end = (std::min)(end, upper);
+                    if (start < end) {
+                        covered.Add(start, end - start);
+                    }
+                });
+            };
+            for (const auto& ranges : pending_download_ranges) {
+                collect(ranges);
+            }
+            for (const auto& ranges : committed_gpu_modified_ranges) {
+                collect(ranges);
+            }
+            collect(uncommitted_gpu_modified_ranges);
+            u64 bytes = 0;
+            covered.ForEach([&](DAddr start, DAddr end) { bytes += end - start; });
+            pending &= bytes >= upper - lower;
+        });
+        return pending;
+    }
 
     /// Without downloads at every fence, a guest CPU read is the only way GPU-written buffer
     /// data reaches guest memory, so reads must ask the buffer cache (GetFlushArea).
@@ -693,6 +760,23 @@ private:
                 queued += upper - lower;
             }
         });
+        if (!cpu_read_pages.empty() && HotReadWindow().count() > 0) {
+            const auto now = std::chrono::steady_clock::now();
+            cpu_read_ranges.ForEachInRange(device_addr, size, [&](DAddr lower, DAddr upper) {
+                lower = (std::max)(lower, device_addr);
+                upper = (std::min)(upper, end);
+                for (DAddr page = Common::AlignDown(lower, Core::DEVICE_PAGESIZE); page < upper;
+                     page += Core::DEVICE_PAGESIZE) {
+                    const auto it = cpu_read_pages.find(page);
+                    if (it == cpu_read_pages.end() || now - it->second.last > HotReadWindow()) {
+                        continue;
+                    }
+                    const DAddr begin = (std::max)(page, lower);
+                    const DAddr finish = (std::min)(page + Core::DEVICE_PAGESIZE, upper);
+                    uncommitted_gpu_modified_ranges.Add(begin, finish - begin);
+                }
+            });
+        }
         if (queued < size) {
             ArmReadTraps(device_addr, size);
         }
@@ -717,6 +801,26 @@ private:
     /// writes in all of them, so the reads that usually follow it find nothing left to flush.
     Common::RangeSet<DAddr> cpu_read_ranges;
     bool download_cpu_read_ranges{};
+    /// Pages of cpu_read_ranges by the time of their last trapped read. GPU writes to a page read
+    /// within HotReadWindow are copied back at the next fence, so the read that follows waits
+    /// for that copy instead of flushing (EDEN_NX2_PREFLUSH_HOT_MS, 0 keeps every read on the trap).
+    struct ReadPage {
+        std::chrono::steady_clock::time_point last{};
+        std::chrono::steady_clock::time_point previous{};
+        u32 count{};
+    };
+    std::unordered_map<DAddr, ReadPage> cpu_read_pages;
+    static std::chrono::milliseconds HotReadWindow() {
+        static const std::chrono::milliseconds window = [] {
+            const char* value = std::getenv("EDEN_NX2_PREFLUSH_HOT_MS");
+            return std::chrono::milliseconds{value == nullptr ? 20000 : std::atoll(value)};
+        }();
+        return window;
+    }
+    bool IsHotReadPage(DAddr page, std::chrono::steady_clock::time_point now) const {
+        const auto it = cpu_read_pages.find(page);
+        return it != cpu_read_pages.end() && now - it->second.last <= HotReadWindow();
+    }
     Common::RangeSet<DAddr> gpu_modified_ranges;
     std::deque<Common::RangeSet<DAddr>> committed_gpu_modified_ranges;
 

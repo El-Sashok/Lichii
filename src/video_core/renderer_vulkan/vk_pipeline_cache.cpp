@@ -1162,8 +1162,13 @@ void PipelineCache::EvictUnusedPipelines() {
     // Each built pipeline holds ~0.45 MB of driver memory and none was ever destroyed, so it grew
     // with every place a session went (title 1: 1,500 on its title screen alone). One unused for
     // this long is destroyed; it takes 2-3 ms to build again from the driver's pipeline cache.
-    constexpr u64 EvictAfterFrames = 9000;
-    if (frame_count <= EvictAfterFrames) {
+    // Building again costs ~3.4 ms of shader translation on the GPU thread per pipeline, in
+    // bursts when a session returns to a place (EDEN_NX2_PIPELINE_EVICT_FRAMES, 0 never evicts).
+    static const u64 EvictAfterFrames = [] {
+        const char* value = std::getenv("EDEN_NX2_PIPELINE_EVICT_FRAMES");
+        return value == nullptr ? u64{0} : static_cast<u64>(std::strtoull(value, nullptr, 10));
+    }();
+    if (EvictAfterFrames == 0 || frame_count <= EvictAfterFrames) {
         return;
     }
     const u64 cutoff = frame_count - EvictAfterFrames;
@@ -1427,6 +1432,9 @@ namespace {
 // emits it; the driver compile is on workers): the first 400 over 2 ms and every one over 100 ms
 // are logged, and the totals every 10 s, to tell how much of the stutter on new content is
 // translation.
+std::atomic<u64> runtime_cached_pipelines{}, runtime_new_pipelines{},
+    runtime_unserializable_pipelines{};
+
 void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_point begin,
                            const std::string& shaders) {
     static std::chrono::steady_clock::duration total{};
@@ -1452,9 +1460,13 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
         LOG_INFO(Render_Vulkan,
                  "Runtime pipelines in the last 10 s: {} built, {:.1f} ms on the GPU thread "
                  "({:.1f} ms of it graphics SPIR-V), {:.1f} ms graphics SPIR-V on workers, "
-                 "{:.1f} ms of draws held for unbuilt pipelines",
+                 "{:.1f} ms of draws held for unbuilt pipelines; graphics: {} in the disk cache "
+                 "but not built at boot, {} new, {} not serializable",
                  count, ms(total), ms(take(runtime_spirv_ns[0])), ms(take(runtime_spirv_ns[1])),
-                 ms(GraphicsPipeline::TakeHoldTime()));
+                 ms(GraphicsPipeline::TakeHoldTime()),
+                 runtime_cached_pipelines.exchange(0, std::memory_order_relaxed),
+                 runtime_new_pipelines.exchange(0, std::memory_order_relaxed),
+                 runtime_unserializable_pipelines.exchange(0, std::memory_order_relaxed));
         total = {};
         count = 0;
         window = now;
@@ -1500,10 +1512,21 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     }
     if (disk_pipelines.contains(graphics_key.Hash())) {
         // In the disk cache already, only not built at boot.
+        runtime_cached_pipelines.fetch_add(1, std::memory_order_relaxed);
         QueueVulkanPipelineCacheFlush();
         return pipeline;
     }
     disk_pipelines.insert(graphics_key.Hash());
+    {
+        bool serializable = true;
+        for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
+            if (graphics_key.unique_hashes[index] != 0) {
+                serializable &= environments.envs[index].CanBeSerialized();
+            }
+        }
+        (serializable ? runtime_new_pipelines : runtime_unserializable_pipelines)
+            .fetch_add(1, std::memory_order_relaxed);
+    }
     serialization_thread.QueueWork([this, key = graphics_key, envs = std::move(environments.envs)] {
         boost::container::static_vector<const GenericEnvironment*, Maxwell::MaxShaderProgram>
             env_ptrs;
