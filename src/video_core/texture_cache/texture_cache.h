@@ -164,12 +164,13 @@ void TextureCache<P>::RunGarbageCollector() {
             (!high_priority_mode && must_download)) {
             return false;
         }
-        if (must_download) {
+        if (must_download && !SkipsDepthUpload(image.info.format)) {
             auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
             const auto copies = FullDownloadCopies(image.info);
             image.DownloadMemory(map, copies);
             runtime.Finish();
             SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
+            NoteGuestDownload(image);
             ++gc_download_deletes;
         }
         if (True(image.flags & ImageFlagBits::Tracked)) {
@@ -430,9 +431,9 @@ void TextureCache<P>::TickFrame() {
                  images_created, images_deleted, gc_deletes + gc_costly_deletes, gc_costly_deletes,
                  gc_download_deletes,
                  async_decodes_queued, astc_opaque_images, astc_alpha_images);
-        LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} uploads from guest memory, {} MiB (largest {} MiB, {} by layer), {} depth uploads skipped",
-                 images_uploaded, uploaded_bytes >> 20, largest_upload >> 20, layer_uploads, depth_uploads_skipped);
-        images_uploaded = uploaded_bytes = largest_upload = layer_uploads = depth_uploads_skipped = 0;
+        LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} uploads from guest memory, {} MiB (largest {} MiB, {} by layer), {} depth and {} color uploads skipped, {} stale targets evicted",
+                 images_uploaded, uploaded_bytes >> 20, largest_upload >> 20, layer_uploads, depth_uploads_skipped, color_uploads_skipped, stale_targets_evicted);
+        images_uploaded = uploaded_bytes = largest_upload = layer_uploads = depth_uploads_skipped = color_uploads_skipped = stale_targets_evicted = 0;
         astc_opaque_images = astc_alpha_images = 0;
         std::vector<std::pair<u32, u64>> shapes;
         for (const auto& [key, value] : created_shapes) shapes.emplace_back(value.first, key);
@@ -785,6 +786,34 @@ bool TextureCache<P>::RescaleRenderTargets() {
 }
 
 template <class P>
+bool TextureCache<P>::SkipsDepthUpload(PixelFormat format) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_SKIP_DEPTH_UPLOAD");
+        return value == nullptr || value[0] != '0';
+    }();
+    const auto type = VideoCore::Surface::GetFormatType(format);
+    return enabled && (type == VideoCore::Surface::SurfaceType::Depth ||
+                       type == VideoCore::Surface::SurfaceType::Stencil ||
+                       type == VideoCore::Surface::SurfaceType::DepthStencil);
+}
+
+template <class P>
+bool TextureCache<P>::SkipsColorUpload(PixelFormat format) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_SKIP_COLOR_UPLOAD");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled && VideoCore::Surface::GetFormatType(format) == VideoCore::Surface::SurfaceType::ColorTexture;
+}
+
+template <class P>
+void TextureCache<P>::NoteGuestDownload(const ImageBase& image) {
+    for (DAddr page = image.cpu_addr & ~DAddr{0xfff}; page < image.cpu_addr_end; page += 0x1000) {
+        downloaded_pages.insert(page);
+    }
+}
+
+template <class P>
 void TextureCache<P>::ResolveDeferredRtRefreshes() {
     if (deferred_rt_refreshes.empty()) {
         return;
@@ -957,6 +986,14 @@ FramebufferId TextureCache<P>::GetFramebufferId(const RenderTargets& key) {
     ImageView* const depth_buffer = key.depth_buffer_id ? &slot_image_views[key.depth_buffer_id] : nullptr;
     runtime.FlushDeferredClear();
     framebuffer_id = slot_framebuffers.insert(runtime, color_buffers, depth_buffer, key);
+    for (const ImageViewId id : key.color_buffer_ids) {
+        if (id) {
+            view_framebuffers[id].push_back(key);
+        }
+    }
+    if (key.depth_buffer_id) {
+        view_framebuffers[key.depth_buffer_id].push_back(key);
+    }
     return framebuffer_id;
 }
 
@@ -1039,6 +1076,7 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
             Image& image = slot_images[entry.image_id];
             SwizzleImage(*gpu_memory, image.gpu_addr, image.info, entry.copies,
                          entry.map.mapped_span, swizzle_data_buffer);
+            NoteGuestDownload(image);
         }
         pending.clear();
         pending_bytes = 0;
@@ -1571,6 +1609,7 @@ void TextureCache<P>::PopAsyncFlushes() {
                 std::span<u8> download_span =
                     download_buffer.mapped_span.subspan(download_buffer.offset);
                 SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span, swizzle_data_buffer);
+                NoteGuestDownload(image);
             } else {
                 const BufferDownload& buffer_info = slot_buffer_downloads[download_info.object_id];
                 std::span<u8> download_span =
@@ -1619,6 +1658,7 @@ void TextureCache<P>::PopAsyncFlushes() {
             const ImageBase& image = download_info.GetImage(slot_images);
             const auto copies = FullDownloadCopies(image.info);
             SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span, swizzle_data_buffer);
+            NoteGuestDownload(image);
             download_map.offset += image.unswizzled_size_bytes;
             download_span = download_span.subspan(image.unswizzled_size_bytes);
         }
@@ -2755,29 +2795,20 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         defer_rt_refresh && std::ranges::all_of(join_copies_to_do, [](const JoinCopy& copy) {
             return copy.is_alias;
         });
-    // EDEN_NX2_SKIP_DEPTH_UPLOAD=0: a new depth or stencil image is uploaded from guest memory
-    // like any other. The CPU writes no depth: what those pages hold is what an earlier image at
-    // the address left before it was deleted. Pages a copy or dispatch wrote are still uploaded.
-    static const bool skip_depth_uploads = [] {
-        const char* value = std::getenv("EDEN_NX2_SKIP_DEPTH_UPLOAD");
-        return value == nullptr || value[0] != '0';
-    }();
-    const auto surface_type = VideoCore::Surface::GetFormatType(new_info.format);
-    bool fresh_depth = skip_depth_uploads && join_copies_to_do.empty() &&
-                       (surface_type == VideoCore::Surface::SurfaceType::Depth ||
-                        surface_type == VideoCore::Surface::SurfaceType::Stencil ||
-                        surface_type == VideoCore::Surface::SurfaceType::DepthStencil);
+    bool fresh_target = join_copies_to_do.empty() &&
+                        (SkipsDepthUpload(new_info.format) ||
+                         (finding_render_target && SkipsColorUpload(new_info.format)));
     for (DAddr page = cpu_addr & ~DAddr{0xfff};
-         fresh_depth && page < cpu_addr + new_image.guest_size_bytes; page += 0x1000) {
-        fresh_depth = !Tegra::Nx2IsGpuWritten(page);
+         fresh_target && page < cpu_addr + new_image.guest_size_bytes; page += 0x1000) {
+        fresh_target = !Tegra::Nx2IsGpuWritten(page) && !downloaded_pages.contains(page);
     }
-    if (fresh_depth) {
+    if (fresh_target) {
         new_image.flags &= ~ImageFlagBits::CpuModified;
         if (False(new_image.flags & ImageFlagBits::Tracked)) {
             TrackImage(new_image, new_image_id);
         }
         runtime.TransitionImageLayout(new_image);
-        ++depth_uploads_skipped;
+        ++(SkipsDepthUpload(new_info.format) ? depth_uploads_skipped : color_uploads_skipped);
     } else if (deferred_refresh) {
         deferred_rt_refreshes.push_back(new_image_id);
         runtime.TransitionImageLayout(new_image);
@@ -2817,8 +2848,19 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         join_alias_indices.emplace(aliased_id, alias_index);
         new_image.flags |= ImageFlagBits::Alias;
     }
+    static const u64 stale_target_frames = [] {
+        const char* value = std::getenv("EDEN_NX2_RT_EVICT_OVERLAPS");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) : 2ULL;
+    }();
+    boost::container::small_vector<ImageId, 16> stale_ids;
     for (const ImageId aliased_id : join_bad_overlap_ids) {
         ImageBase& aliased = slot_images[aliased_id];
+        if (stale_target_frames != 0 && finding_render_target &&
+            aliased.info.resources.levels == 1 && aliased.info.block.depth == 0 &&
+            frame_tick - lru_cache.Tick(aliased.lru_index) > stale_target_frames) {
+            stale_ids.push_back(aliased_id);
+            continue;
+        }
         aliased.overlapping_images.push_back(new_image_id);
         new_image.overlapping_images.push_back(aliased_id);
         if (aliased.info.resources.levels == 1 && aliased.info.block.depth == 0 &&
@@ -2831,6 +2873,15 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
     }
 
+    for (const ImageId stale_id : stale_ids) {
+        Image& stale = slot_images[stale_id];
+        if (True(stale.flags & ImageFlagBits::Tracked)) {
+            UntrackImage(stale, stale_id);
+        }
+        UnregisterImage(stale_id);
+        DeleteImage(stale_id);
+        ++stale_targets_evicted;
+    }
     for (const auto& copy_object : join_copies_to_do) {
         Image& overlap = slot_images[copy_object.id];
         if (copy_object.is_alias) {
@@ -3078,11 +3129,13 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
     }
     ImageId image_id{};
     bool delete_state = has_deleted_images;
+    finding_render_target = true;
     do {
         has_deleted_images = false;
         image_id = FindOrInsertImage(info, gpu_addr);
         delete_state |= has_deleted_images;
     } while (has_deleted_images);
+    finding_render_target = false;
     has_deleted_images = delete_state;
     if (!image_id) {
         return NULL_IMAGE_VIEW_ID;
@@ -3615,10 +3668,27 @@ void TextureCache<P>::RemoveImageViewReferences(std::span<const ImageViewId> rem
 template <class P>
 void TextureCache<P>::RemoveFramebuffers(std::span<const ImageViewId> removed_views) {
     runtime.FlushDeferredClear();
-    auto it = framebuffers.begin();
-    while (it != framebuffers.end()) {
-        if (it->first.Contains(removed_views)) {
-            auto framebuffer_id = it->second;
+    const auto forget = [this](ImageViewId view_id, const RenderTargets& key) {
+        const auto it = view_framebuffers.find(view_id);
+        if (it == view_framebuffers.end()) {
+            return;
+        }
+        std::erase(it->second, key);
+        if (it->second.empty()) {
+            view_framebuffers.erase(it);
+        }
+    };
+    for (const ImageViewId removed : removed_views) {
+        const auto node = view_framebuffers.extract(removed);
+        if (node.empty()) {
+            continue;
+        }
+        for (const RenderTargets& key : node.mapped()) {
+            const auto it = framebuffers.find(key);
+            if (it == framebuffers.end()) {
+                continue;
+            }
+            const FramebufferId framebuffer_id = it->second;
             ASSERT(framebuffer_id);
             if (framebuffer_id == last_framebuffer_id) {
                 last_framebuffer_id = {};
@@ -3626,9 +3696,15 @@ void TextureCache<P>::RemoveFramebuffers(std::span<const ImageViewId> removed_vi
             }
             sentenced_framebuffers.Push(std::move(slot_framebuffers[framebuffer_id]));
             slot_framebuffers.erase(framebuffer_id);
-            it = framebuffers.erase(it);
-        } else {
-            ++it;
+            framebuffers.erase(it);
+            for (const ImageViewId id : key.color_buffer_ids) {
+                if (id && id != removed) {
+                    forget(id, key);
+                }
+            }
+            if (key.depth_buffer_id && key.depth_buffer_id != removed) {
+                forget(key.depth_buffer_id, key);
+            }
         }
     }
 }

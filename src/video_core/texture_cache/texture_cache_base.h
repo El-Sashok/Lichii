@@ -16,6 +16,7 @@
 #include <type_traits>
 // TODO: find out which don't require stable iters
 #include <unordered_map>
+#include <unordered_set>
 #include "common/container/unordered_map.h"
 #include "common/container/unordered_set.h"
 #include <vector>
@@ -145,6 +146,8 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     std::vector<u8> astc_scan_buffer;
     u64 images_deleted{};
     u64 depth_uploads_skipped{};
+    u64 color_uploads_skipped{};
+    u64 stale_targets_evicted{};
     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
     bool debug_stats{true}; ///< Collect what only the debug statistics lines use
 
@@ -265,6 +268,8 @@ public:
 
     /// Uploads the deferred new render targets the clear does not overwrite whole
     void ResolveDeferredRtRefreshes();
+    static bool SkipsDepthUpload(PixelFormat format);
+    static bool SkipsColorUpload(PixelFormat format);
 
     /// Update bound render targets and upload memory if necessary
     /// @param is_clear True when the render targets are being used for clears
@@ -549,6 +554,7 @@ private:
     u64 last_framebuffer_serial = 0;
 
     ::Common::unordered_map<RenderTargets, FramebufferId> framebuffers;
+    std::unordered_map<ImageViewId, std::vector<RenderTargets>> view_framebuffers;
     ::Common::unordered_map<u64, std::vector<ImageMapId>, Common::IdentityHash<u64>> page_table;
     ::Common::unordered_map<ImageId, boost::container::small_vector<ImageViewId, 16>> sparse_views;
 
@@ -564,6 +570,9 @@ private:
     /// While a clear binds its render targets (UpdateRenderTargets(true)): JoinImages leaves a new
     /// target's upload to ResolveDeferredRtRefreshes, which skips it when the clear overwrites it.
     bool defer_rt_refresh = false;
+    bool finding_render_target = false;
+    std::unordered_set<DAddr> downloaded_pages;
+    void NoteGuestDownload(const ImageBase& image);
     std::vector<ImageId> deferred_rt_refreshes;
     bool is_rescaling = false;
     u64 total_used_memory = 0;
