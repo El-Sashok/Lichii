@@ -7,7 +7,11 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <thread>
 #include <limits>
 #include <optional>
 #include <string>
@@ -1183,6 +1187,11 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     } else {
         split.Method(this, method, argument, is_last_call, nullptr);
     }
+    if (method == MAXWELL3D_REG_INDEX(report_semaphore.query)) {
+        split.NoteSemaphoreWrite(
+            (GPUVAddr{fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_high)]} << 32) |
+            fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_low)]);
+    }
 }
 
 void Maxwell3D::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
@@ -1288,6 +1297,11 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         }
     }
     split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr);
+    if (method == MAXWELL3D_REG_INDEX(report_semaphore.query)) {
+        split.NoteSemaphoreWrite(
+            (GPUVAddr{fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_high)]} << 32) |
+            fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_low)]);
+    }
 }
 
 void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
@@ -1358,6 +1372,61 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     }
     VideoCommon::Nx2Profile::CountDmaRead(macro);
     split.Drain(VideoCommon::DrainSite::MacroDmaRead);
+    // The drain issued the queued reports to the host GPU; their results reach guest memory only
+    // when the host finishes them (EDEN_NX2_QUERY_DMA_WAIT=0 reads without waiting).
+    static const bool wait_reports = [] {
+        const char* value = std::getenv("EDEN_NX2_QUERY_DMA_WAIT");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (wait_reports && split.ReportMayBePending(source, read_bytes)) {
+        const u64 sync_position = split.WritePosition();
+        auto landed = std::make_shared<std::atomic<bool>>(false);
+        bool pending = false;
+        split.Run(
+            [this, source, read_bytes, landed_ptr = &landed, pending_ptr = &pending] {
+                if (!VideoCommon::QueryDma::HasPendingQueries(memory_manager, *rasterizer, source,
+                                                              read_bytes)) {
+                    return;
+                }
+                *pending_ptr = true;
+                rasterizer->SyncOperation([landed = *landed_ptr] {
+                    landed->store(true, std::memory_order_release);
+                });
+                rasterizer->SignalReference();
+            },
+            VideoCommon::DrainSite::MacroDmaFlush);
+        if (!pending) {
+            split.ClearReports(source, read_bytes);
+        } else {
+            const auto start = std::chrono::steady_clock::now();
+            const auto deadline = start + std::chrono::milliseconds{100};
+            while (!landed->load(std::memory_order_acquire)) {
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    LOG_WARNING(HW_GPU,
+                                "Timed out waiting for reports before an MME DMA read: source "
+                                "{:#x}, {} bytes, ring backlog {} words",
+                                source, read_bytes, split.BacklogWords());
+                    break;
+                }
+                std::this_thread::yield();
+            }
+            if (landed->load(std::memory_order_acquire)) {
+                split.MarkReportsSynced(sync_position);
+            }
+            static u64 waits{}, waited_us{}, max_us{};
+            const u64 us = static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - start)
+                    .count());
+            waited_us += us;
+            max_us = std::max(max_us, us);
+            if (++waits == 1024) {
+                LOG_INFO(HW_GPU, "NX2 report waits (host GPU) last 1024: avg {} us, max {} us",
+                         waited_us / 1024, max_us);
+                waits = waited_us = max_us = 0;
+            }
+        }
+    }
     if (VideoCommon::QueryDma::TraceEnabled()) {
         split.Run(
             [this, macro, method, source, read_bytes] {

@@ -175,6 +175,57 @@ public:
     /// of it was still queued.
     bool WaitForSync();
 
+    struct ReportWrite {
+        u64 addr{};
+        u64 position{};
+    };
+    static constexpr size_t ReportSlot(u64 addr) noexcept {
+        return static_cast<size_t>((addr >> 3) & 0xFFFFU);
+    }
+    /// Records the ring write position of a deferred GPU semaphore or query write.
+    void NoteSemaphoreWrite(u64 addr) noexcept {
+        ReportWrite& entry = report_writes[ReportSlot(addr)];
+        if (entry.addr != 0 && entry.addr != addr) {
+            ++report_slot_collisions;
+        }
+        entry = {addr, write_position};
+    }
+    /// Whether a report in [addr, addr + size) was queued after the last confirmed report sync.
+    [[nodiscard]] bool ReportMayBePending(u64 addr, size_t size) const noexcept {
+        for (u64 current = addr; current < addr + size; current += 8) {
+            const ReportWrite& entry = report_writes[ReportSlot(current)];
+            if (entry.addr == current && entry.position > report_synced_position) {
+                return true;
+            }
+        }
+        return false;
+    }
+    /// Forgets the reports in [addr, addr + size): the back found none of them pending.
+    void ClearReports(u64 addr, size_t size) noexcept {
+        for (u64 current = addr; current < addr + size; current += 8) {
+            ReportWrite& entry = report_writes[ReportSlot(current)];
+            if (entry.addr == current) {
+                entry.position = 0;
+            }
+        }
+    }
+    /// Every report queued up to `position` has reached guest memory.
+    void MarkReportsSynced(u64 position) noexcept {
+        report_synced_position = position;
+    }
+    [[nodiscard]] u64 WritePosition() const noexcept {
+        return write_position;
+    }
+    [[nodiscard]] u64 ReportSlotCollisions() const noexcept {
+        return report_slot_collisions;
+    }
+    /// Any thread: ring words published by the front and not yet executed by the back.
+    [[nodiscard]] u64 BacklogWords() const noexcept {
+        const u64 done = consumed.load(std::memory_order_relaxed);
+        const u64 sent = published.load(std::memory_order_relaxed);
+        return sent > done ? sent - done : 0;
+    }
+
 private:
     friend struct GpuSplitTestAccess;
 
@@ -249,6 +300,9 @@ private:
     u64 last_sync_position{};
     u64 published_local{};
     u64 consumed_cache{};
+    std::array<ReportWrite, 0x10000> report_writes{};
+    u64 report_slot_collisions{};
+    u64 report_synced_position{};
     /// Words between publishes: small right after a drain, while the back has nothing to do.
     size_t publish_every{PublishEvery};
     Tegra::Engines::EngineInterface* front_engine{};

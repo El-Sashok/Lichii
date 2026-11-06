@@ -462,7 +462,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             }
             // Hand ring space back now and then while working through a long batch, and at once
             // when the front waits for this position (WaitForWriters).
-            if ((read_position - last_store >= 4096 ||
+            if ((read_position - last_store >= 1024 ||
                  read_position >= wait_target.load(std::memory_order_relaxed)) &&
                 read_position != available) {
                 consumed.store(read_position, std::memory_order_seq_cst);
